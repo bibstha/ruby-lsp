@@ -5,15 +5,10 @@ module RubyLsp
   class Server < BaseServer
     extend T::Sig
 
-    # The instance of the index for this server. Only exposed for tests
-    sig { returns(RubyIndexer::Index) }
-    attr_reader :index
-
     sig { params(test_mode: T::Boolean).void }
     def initialize(test_mode: false)
       super
-      @index = T.let(RubyIndexer::Index.new, RubyIndexer::Index)
-      @store = T.let(Store.new, Store)
+      @global_state = T.let(GlobalState.new, GlobalState)
     end
 
     sig { override.params(message: T::Hash[Symbol, T.untyped]).void }
@@ -87,40 +82,20 @@ module RubyLsp
       $stderr.puts("Error processing #{message[:method]}: #{e.full_message}")
     end
 
+    # The instance of the index for this server. Only exposed for tests
+    sig { returns(RubyIndexer::Index) }
+    def index
+      @global_state.index
+    end
+
     private
 
     sig { params(message: T::Hash[Symbol, T.untyped]).void }
     def run_initialize(message)
       options = message[:params]
-      workspace_uri = options.dig(:workspaceFolders, 0, :uri)
-      @store.workspace_uri = URI(workspace_uri) if workspace_uri
-
-      client_name = options.dig(:clientInfo, :name)
-      @store.client_name = client_name if client_name
-
-      encodings = options.dig(:capabilities, :general, :positionEncodings)
-      @store.encoding = if encodings.nil? || encodings.empty?
-        Constant::PositionEncodingKind::UTF16
-      elsif encodings.include?(Constant::PositionEncodingKind::UTF8)
-        Constant::PositionEncodingKind::UTF8
-      else
-        encodings.first
-      end
-
-      progress = options.dig(:capabilities, :window, :workDoneProgress)
-      @store.supports_progress = progress.nil? ? true : progress
-      formatter = options.dig(:initializationOptions, :formatter) || "auto"
-      @store.formatter = if formatter == "auto"
-        DependencyDetector.instance.detected_formatter
-      else
-        formatter
-      end
+      @global_state.ingest_initialization_options(options)
 
       configured_features = options.dig(:initializationOptions, :enabledFeatures)
-      @store.experimental_features = options.dig(:initializationOptions, :experimentalFeaturesEnabled) || false
-
-      configured_hints = options.dig(:initializationOptions, :featuresConfiguration, :inlayHint)
-      T.must(@store.features_configuration.dig(:inlayHint)).configuration.merge!(configured_hints) if configured_hints
 
       enabled_features = case configured_features
       when Array
@@ -155,14 +130,14 @@ module RubyLsp
             change: Constant::TextDocumentSyncKind::INCREMENTAL,
             open_close: true,
           ),
-          position_encoding: @store.encoding,
+          position_encoding: @global_state.encoding,
           selection_range_provider: enabled_features["selectionRanges"],
           hover_provider: hover_provider,
           document_symbol_provider: document_symbol_provider,
           document_link_provider: document_link_provider,
           folding_range_provider: folding_ranges_provider,
           semantic_tokens_provider: semantic_tokens_provider,
-          document_formatting_provider: enabled_features["formatting"] && formatter != "none",
+          document_formatting_provider: enabled_features["formatting"] && @global_state.formatter != "none",
           document_highlight_provider: enabled_features["documentHighlights"],
           code_action_provider: code_action_provider,
           document_on_type_formatting_provider: on_type_formatting_provider,
@@ -178,7 +153,7 @@ module RubyLsp
           name: "Ruby LSP",
           version: VERSION,
         },
-        formatter: @store.formatter,
+        formatter: @global_state.formatter,
       }
 
       send_message(Result.new(id: message[:id], response: response))
@@ -244,7 +219,7 @@ module RubyLsp
     sig { params(message: T::Hash[Symbol, T.untyped]).void }
     def text_document_did_open(message)
       text_document = message.dig(:params, :textDocument)
-      @store.set(uri: text_document[:uri], source: text_document[:text], version: text_document[:version])
+      @global_state.store.set(uri: text_document[:uri], source: text_document[:text], version: text_document[:version])
     rescue Errno::ENOENT
       # If someone re-opens the editor with a file that was deleted or doesn't exist in the current branch, we don't
       # want to crash
@@ -253,7 +228,7 @@ module RubyLsp
     sig { params(message: T::Hash[Symbol, T.untyped]).void }
     def text_document_did_close(message)
       uri = message.dig(:params, :textDocument, :uri)
-      @store.delete(uri)
+      @global_state.store.delete(uri)
 
       # Clear diagnostics for the closed file, so that they no longer appear in the problems tab
       send_message(
@@ -270,14 +245,18 @@ module RubyLsp
       text_document = params[:textDocument]
 
       @mutex.synchronize do
-        @store.push_edits(uri: text_document[:uri], edits: params[:contentChanges], version: text_document[:version])
+        @global_state.store.push_edits(
+          uri: text_document[:uri],
+          edits: params[:contentChanges],
+          version: text_document[:version],
+        )
       end
     end
 
     sig { params(message: T::Hash[Symbol, T.untyped]).void }
     def text_document_selection_range(message)
       uri = message.dig(:params, :textDocument, :uri)
-      ranges = @store.cache_fetch(uri, "textDocument/selectionRange") do |document|
+      ranges = @global_state.store.cache_fetch(uri, "textDocument/selectionRange") do |document|
         Requests::SelectionRanges.new(document).perform
       end
 
@@ -298,7 +277,7 @@ module RubyLsp
     sig { params(message: T::Hash[Symbol, T.untyped]).void }
     def run_combined_requests(message)
       uri = URI(message.dig(:params, :textDocument, :uri))
-      document = @store.get(uri)
+      document = @global_state.store.get(uri)
 
       # If the response has already been cached by another request, return it
       cached_response = document.cache_get(message[:method])
@@ -341,7 +320,7 @@ module RubyLsp
       params = message[:params]
       range = params[:range]
       uri = params.dig(:textDocument, :uri)
-      document = @store.get(uri)
+      document = @global_state.store.get(uri)
       start_line = range.dig(:start, :line)
       end_line = range.dig(:end, :line)
 
@@ -356,7 +335,7 @@ module RubyLsp
     sig { params(message: T::Hash[Symbol, T.untyped]).void }
     def text_document_formatting(message)
       # If formatter is set to `auto` but no supported formatting gem is found, don't attempt to format
-      if @store.formatter == "none"
+      if @global_state.formatter == "none"
         send_empty_response(message[:id])
         return
       end
@@ -365,12 +344,12 @@ module RubyLsp
       # Do not format files outside of the workspace. For example, if someone is looking at a gem's source code, we
       # don't want to format it
       path = uri.to_standardized_path
-      unless path.nil? || path.start_with?(T.must(@store.workspace_uri.to_standardized_path))
+      unless path.nil? || path.start_with?(@global_state.workspace_path)
         send_empty_response(message[:id])
         return
       end
 
-      response = Requests::Formatting.new(@store.get(uri), formatter: @store.formatter).perform
+      response = Requests::Formatting.new(@global_state.store.get(uri), formatter: @global_state.formatter).perform
       send_message(Result.new(id: message[:id], response: response))
     rescue Requests::Formatting::InvalidFormatter => error
       send_message(Notification.window_show_error("Configuration error: #{error.message}"))
@@ -384,7 +363,7 @@ module RubyLsp
     def text_document_document_highlight(message)
       params = message[:params]
       dispatcher = Prism::Dispatcher.new
-      document = @store.get(params.dig(:textDocument, :uri))
+      document = @global_state.store.get(params.dig(:textDocument, :uri))
       request = Requests::DocumentHighlight.new(document, params[:position], dispatcher)
       dispatcher.dispatch(document.tree)
       send_message(Result.new(id: message[:id], response: request.perform))
@@ -398,10 +377,10 @@ module RubyLsp
         Result.new(
           id: message[:id],
           response: Requests::OnTypeFormatting.new(
-            @store.get(params.dig(:textDocument, :uri)),
+            @global_state.store.get(params.dig(:textDocument, :uri)),
             params[:position],
             params[:ch],
-            @store.client_name,
+            @global_state.client_name,
           ).perform,
         ),
       )
@@ -411,14 +390,14 @@ module RubyLsp
     def text_document_hover(message)
       params = message[:params]
       dispatcher = Prism::Dispatcher.new
-      document = @store.get(params.dig(:textDocument, :uri))
+      document = @global_state.store.get(params.dig(:textDocument, :uri))
 
       send_message(
         Result.new(
           id: message[:id],
           response: Requests::Hover.new(
             document,
-            @index,
+            @global_state.index,
             params[:position],
             dispatcher,
             document.typechecker_enabled?,
@@ -430,9 +409,9 @@ module RubyLsp
     sig { params(message: T::Hash[Symbol, T.untyped]).void }
     def text_document_inlay_hint(message)
       params = message[:params]
-      hints_configurations = T.must(@store.features_configuration.dig(:inlayHint))
+      hints_configurations = T.must(@global_state.features_configuration.dig(:inlayHint))
       dispatcher = Prism::Dispatcher.new
-      document = @store.get(params.dig(:textDocument, :uri))
+      document = @global_state.store.get(params.dig(:textDocument, :uri))
       request = Requests::InlayHints.new(document, params[:range], hints_configurations, dispatcher)
       dispatcher.visit(document.tree)
       send_message(Result.new(id: message[:id], response: request.perform))
@@ -441,7 +420,7 @@ module RubyLsp
     sig { params(message: T::Hash[Symbol, T.untyped]).void }
     def text_document_code_action(message)
       params = message[:params]
-      document = @store.get(params.dig(:textDocument, :uri))
+      document = @global_state.store.get(params.dig(:textDocument, :uri))
 
       send_message(
         Result.new(
@@ -459,7 +438,7 @@ module RubyLsp
     def code_action_resolve(message)
       params = message[:params]
       uri = URI(params.dig(:data, :uri))
-      document = @store.get(uri)
+      document = @global_state.store.get(uri)
       result = Requests::CodeActionResolve.new(document, params).perform
 
       case result
@@ -484,12 +463,12 @@ module RubyLsp
       # source code, we don't want to show diagnostics for it
       uri = message.dig(:params, :textDocument, :uri)
       path = uri.to_standardized_path
-      unless path.nil? || path.start_with?(T.must(@store.workspace_uri.to_standardized_path))
+      unless path.nil? || path.start_with?(@global_state.workspace_path)
         send_empty_response(message[:id])
         return
       end
 
-      response = @store.cache_fetch(uri, "textDocument/diagnostic") do |document|
+      response = @global_state.store.cache_fetch(uri, "textDocument/diagnostic") do |document|
         Requests::Diagnostics.new(document).perform
       end
 
@@ -508,14 +487,14 @@ module RubyLsp
     def text_document_completion(message)
       params = message[:params]
       dispatcher = Prism::Dispatcher.new
-      document = @store.get(params.dig(:textDocument, :uri))
+      document = @global_state.store.get(params.dig(:textDocument, :uri))
 
       send_message(
         Result.new(
           id: message[:id],
           response: Requests::Completion.new(
             document,
-            @index,
+            @global_state.index,
             params[:position],
             document.typechecker_enabled?,
             dispatcher,
@@ -528,14 +507,14 @@ module RubyLsp
     def text_document_signature_help(message)
       params = message[:params]
       dispatcher = Prism::Dispatcher.new
-      document = @store.get(params.dig(:textDocument, :uri))
+      document = @global_state.store.get(params.dig(:textDocument, :uri))
 
       send_message(
         Result.new(
           id: message[:id],
           response: Requests::SignatureHelp.new(
             document,
-            @index,
+            @global_state.index,
             params[:position],
             params[:context],
             dispatcher,
@@ -548,14 +527,14 @@ module RubyLsp
     def text_document_definition(message)
       params = message[:params]
       dispatcher = Prism::Dispatcher.new
-      document = @store.get(params.dig(:textDocument, :uri))
+      document = @global_state.store.get(params.dig(:textDocument, :uri))
 
       send_message(
         Result.new(
           id: message[:id],
           response: Requests::Definition.new(
             document,
-            @index,
+            @global_state.index,
             params[:position],
             dispatcher,
             document.typechecker_enabled?,
@@ -578,12 +557,12 @@ module RubyLsp
 
         case change[:type]
         when Constant::FileChangeType::CREATED
-          @index.index_single(indexable)
+          @global_state.index.index_single(indexable)
         when Constant::FileChangeType::CHANGED
-          @index.delete(indexable)
-          @index.index_single(indexable)
+          @global_state.index.delete(indexable)
+          @global_state.index.index_single(indexable)
         when Constant::FileChangeType::DELETED
-          @index.delete(indexable)
+          @global_state.index.delete(indexable)
         end
       end
 
@@ -595,7 +574,7 @@ module RubyLsp
       send_message(
         Result.new(
           id: message[:id],
-          response: Requests::WorkspaceSymbol.new(message.dig(:params, :query), @index).perform,
+          response: Requests::WorkspaceSymbol.new(message.dig(:params, :query), @global_state.index).perform,
         ),
       )
     end
@@ -605,7 +584,7 @@ module RubyLsp
       params = message[:params]
       response = {
         ast: Requests::ShowSyntaxTree.new(
-          @store.get(params.dig(:textDocument, :uri)),
+          @global_state.store.get(params.dig(:textDocument, :uri)),
           params[:range],
         ).perform,
       }
@@ -637,7 +616,7 @@ module RubyLsp
 
     sig { override.void }
     def shutdown
-      @store.clear
+      @global_state.store.clear
       Addon.addons.each(&:deactivate)
     end
 
@@ -649,7 +628,7 @@ module RubyLsp
 
       Thread.new do
         begin
-          @index.index_all do |percentage|
+          @global_state.index.index_all do |percentage|
             progress("indexing-progress", percentage)
             true
           rescue ClosedQueueError
@@ -670,7 +649,7 @@ module RubyLsp
 
     sig { params(id: String, title: String, percentage: Integer).void }
     def begin_progress(id, title, percentage: 0)
-      return unless @store.supports_progress
+      return unless @global_state.supports_progress
 
       send_message(Request.new(
         id: @current_request_id,
@@ -694,7 +673,7 @@ module RubyLsp
 
     sig { params(id: String, percentage: Integer).void }
     def progress(id, percentage)
-      return unless @store.supports_progress
+      return unless @global_state.supports_progress
 
       send_message(
         Notification.new(
@@ -713,7 +692,7 @@ module RubyLsp
 
     sig { params(id: String).void }
     def end_progress(id)
-      return unless @store.supports_progress
+      return unless @global_state.supports_progress
 
       send_message(
         Notification.new(
@@ -733,10 +712,10 @@ module RubyLsp
     def check_formatter_is_available
       # Warn of an unavailable `formatter` setting, e.g. `rubocop` on a project which doesn't have RuboCop.
       # Syntax Tree will always be available via Ruby LSP so we don't need to check for it.
-      return unless @store.formatter == "rubocop"
+      return unless @global_state.formatter == "rubocop"
 
       unless defined?(RubyLsp::Requests::Support::RuboCopRunner)
-        @store.formatter = "none"
+        @global_state.formatter = "none"
 
         send_message(
           Notification.window_show_error(
@@ -752,7 +731,7 @@ module RubyLsp
       return unless uri
 
       parsed_uri = URI(uri)
-      @store.get(parsed_uri).parse
+      @global_state.store.get(parsed_uri).parse
       message[:params][:textDocument][:uri] = parsed_uri
     rescue Errno::ENOENT
       # If we receive a request for a file that no longer exists, we don't want to fail

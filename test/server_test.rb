@@ -186,7 +186,7 @@ class ServerTest < Minitest::Test
   end
 
   def test_formatting_errors_push_window_notification
-    @server.instance_variable_get(:@store).expects(:formatter).raises(StandardError, "boom").once
+    @server.instance_variable_get(:@global_state).expects(:formatter).raises(StandardError, "boom").once
 
     @server.process_message({
       id: 1,
@@ -262,10 +262,10 @@ class ServerTest < Minitest::Test
     capture_subprocess_io do
       @server.process_message({ method: "initialized" })
     end
-    store = @server.instance_variable_get(:@store)
+    global_state = @server.instance_variable_get(:@global_state)
 
-    refute(store.features_configuration.dig(:inlayHint).enabled?(:implicitRescue))
-    refute(store.features_configuration.dig(:inlayHint).enabled?(:implicitHashValue))
+    refute(global_state.features_configuration.dig(:inlayHint).enabled?(:implicitRescue))
+    refute(global_state.features_configuration.dig(:inlayHint).enabled?(:implicitHashValue))
   end
 
   def test_initialize_features_with_provided_configuration
@@ -282,9 +282,9 @@ class ServerTest < Minitest::Test
       })
     end
 
-    store = @server.instance_variable_get(:@store)
-    assert(store.features_configuration.dig(:inlayHint).enabled?(:implicitRescue))
-    assert(store.features_configuration.dig(:inlayHint).enabled?(:implicitHashValue))
+    global_state = @server.instance_variable_get(:@global_state)
+    assert(global_state.features_configuration.dig(:inlayHint).enabled?(:implicitRescue))
+    assert(global_state.features_configuration.dig(:inlayHint).enabled?(:implicitHashValue))
   end
 
   def test_initialize_features_with_partially_provided_configuration
@@ -300,10 +300,10 @@ class ServerTest < Minitest::Test
       })
     end
 
-    store = @server.instance_variable_get(:@store)
+    global_state = @server.instance_variable_get(:@global_state)
 
-    refute(store.features_configuration.dig(:inlayHint).enabled?(:implicitRescue))
-    assert(store.features_configuration.dig(:inlayHint).enabled?(:implicitHashValue))
+    refute(global_state.features_configuration.dig(:inlayHint).enabled?(:implicitRescue))
+    assert(global_state.features_configuration.dig(:inlayHint).enabled?(:implicitHashValue))
   end
 
   def test_initialize_features_with_enable_all_configuration
@@ -319,10 +319,10 @@ class ServerTest < Minitest::Test
       })
     end
 
-    store = @server.instance_variable_get(:@store)
+    global_state = @server.instance_variable_get(:@global_state)
 
-    assert(store.features_configuration.dig(:inlayHint).enabled?(:implicitRescue))
-    assert(store.features_configuration.dig(:inlayHint).enabled?(:implicitHashValue))
+    assert(global_state.features_configuration.dig(:inlayHint).enabled?(:implicitRescue))
+    assert(global_state.features_configuration.dig(:inlayHint).enabled?(:implicitHashValue))
   end
 
   def test_detects_rubocop_if_direct_dependency
@@ -334,8 +334,8 @@ class ServerTest < Minitest::Test
       })
     end
 
-    store = @server.instance_variable_get(:@store)
-    assert_equal("rubocop", store.formatter)
+    global_state = @server.instance_variable_get(:@global_state)
+    assert_equal("rubocop", global_state.formatter)
   end
 
   def test_detects_syntax_tree_if_direct_dependency
@@ -346,8 +346,8 @@ class ServerTest < Minitest::Test
       })
     end
 
-    store = @server.instance_variable_get(:@store)
-    assert_equal("syntax_tree", store.formatter)
+    global_state = @server.instance_variable_get(:@global_state)
+    assert_equal("syntax_tree", global_state.formatter)
   end
 
   def test_gives_rubocop_precedence_if_syntax_tree_also_present
@@ -358,8 +358,8 @@ class ServerTest < Minitest::Test
       })
     end
 
-    store = @server.instance_variable_get(:@store)
-    assert_equal("rubocop", store.formatter)
+    global_state = @server.instance_variable_get(:@global_state)
+    assert_equal("rubocop", global_state.formatter)
   end
 
   def test_sets_formatter_to_none_if_neither_rubocop_or_syntax_tree_are_present
@@ -370,8 +370,8 @@ class ServerTest < Minitest::Test
       })
     end
 
-    store = @server.instance_variable_get(:@store)
-    assert_equal("none", store.formatter)
+    global_state = @server.instance_variable_get(:@global_state)
+    assert_equal("none", global_state.formatter)
   end
 
   def test_shows_error_if_formatter_set_to_rubocop_but_rubocop_not_available
@@ -382,8 +382,8 @@ class ServerTest < Minitest::Test
         })
         @server.process_message({ method: "initialized" })
 
-        store = @server.instance_variable_get(:@store)
-        assert_equal("none", store.formatter)
+        global_state = @server.instance_variable_get(:@global_state)
+        assert_equal("none", global_state.formatter)
 
         # Remove the initialization notifications
         @server.pop_response
@@ -408,8 +408,8 @@ class ServerTest < Minitest::Test
       })
     end
 
-    store = @server.instance_variable_get(:@store)
-    assert_equal("Foo", store.client_name)
+    global_state = @server.instance_variable_get(:@global_state)
+    assert_equal("Foo", global_state.client_name)
   end
 
   def test_workspace_dependencies
