@@ -13,6 +13,7 @@ module RubyLsp
     def initialize(test_mode: false)
       super
       @index = T.let(RubyIndexer::Index.new, RubyIndexer::Index)
+      @store = T.let(Store.new, Store)
     end
 
     sig { override.params(message: T::Hash[Symbol, T.untyped]).void }
@@ -636,6 +637,7 @@ module RubyLsp
 
     sig { override.void }
     def shutdown
+      @store.clear
       Addon.addons.each(&:deactivate)
     end
 
@@ -742,6 +744,18 @@ module RubyLsp
           ),
         )
       end
+    end
+
+    sig { override.params(message: T::Hash[Symbol, T.untyped]).void }
+    def parse_text_document(message)
+      uri = message.dig(:params, :textDocument, :uri)
+      return unless uri
+
+      parsed_uri = URI(uri)
+      @store.get(parsed_uri).parse
+      message[:params][:textDocument][:uri] = parsed_uri
+    rescue Errno::ENOENT
+      # If we receive a request for a file that no longer exists, we don't want to fail
     end
   end
 end

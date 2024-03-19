@@ -18,7 +18,6 @@ module RubyLsp
       @mutex = T.let(Mutex.new, Mutex)
       @worker = T.let(new_worker, Thread)
       @current_request_id = T.let(1, Integer)
-      @store = T.let(Store.new, Store)
       @outgoing_dispatcher = T.let(
         Thread.new do
           unless test_mode
@@ -40,17 +39,7 @@ module RubyLsp
           # We must parse the document under a mutex lock or else we might switch threads and accept text edits in the
           # source. Altering the source reference during parsing will put the parser in an invalid internal state,
           # since it started parsing with one source but then it changed in the middle
-          uri = message.dig(:params, :textDocument, :uri)
-
-          if uri
-            begin
-              parsed_uri = URI(uri)
-              @store.get(parsed_uri).parse
-              message[:params][:textDocument][:uri] = parsed_uri
-            rescue Errno::ENOENT
-              # If we receive a request for a file that no longer exists, we don't want to fail
-            end
-          end
+          parse_text_document(message)
         end
 
         # We need to process shutdown and exit from the main thread in order to close queues and wait for other threads
@@ -87,7 +76,6 @@ module RubyLsp
 
       @worker.join
       @outgoing_dispatcher.join
-      @store.clear
     end
 
     # This method is only intended to be used in tests! Pops the latest response that would be sent to the client
@@ -101,6 +89,9 @@ module RubyLsp
 
     sig { abstract.void }
     def shutdown; end
+
+    sig { abstract.params(message: T::Hash[Symbol, T.untyped]).void }
+    def parse_text_document(message); end
 
     sig { returns(Thread) }
     def new_worker
